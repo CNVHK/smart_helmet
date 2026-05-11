@@ -138,7 +138,7 @@ def build_hardware():
         "sht40": temp_hum,
         "jx90614": JX90614(i2c, config.JX90614_ADDR) if i2c is not None and config.JX90614_ENABLE else None,
         "max30100": MAX30100(i2c) if i2c is not None else None,
-        "barometer": Barometer(i2c),
+        "barometer": Barometer(i2c, addr=config.BAROMETER_ADDR) if i2c is not None and config.BAROMETER_ENABLE else None,
         "light": LightSensor(light_adc),
         "gps": gnss if gnss.gnss is not None else GPSUART(gps_uart),
         "ultrasonic": Ultrasonic(trig, echo),
