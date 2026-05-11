@@ -12,7 +12,8 @@ from drivers.imu import IMU
 from drivers.sht40 import SHT40
 from drivers.jx90614 import JX90614
 from drivers.max30100 import MAX30100
-from drivers.light_sensor import LightSensor
+from drivers.gy302 import GY302
+from drivers.light_sensor import ADCLightSensor
 from drivers.barometer import Barometer
 from drivers.gps_uart import GPSUART
 from drivers.gnss_quectel import QuectelGNSS
@@ -126,20 +127,23 @@ def build_hardware():
     cancel_pin = make_pin(config.CANCEL_BUTTON_PIN, Pin.IN, getattr(Pin, "PULL_UP", None), config.CANCEL_BUTTON_PIN_NAME)
     trig = make_pin(config.ULTRASONIC_TRIG_PIN, Pin.OUT, pin_name=config.ULTRASONIC_TRIG_PIN_NAME)
     echo = make_pin(config.ULTRASONIC_ECHO_PIN, Pin.IN, pin_name=config.ULTRASONIC_ECHO_PIN_NAME)
-    try:
-        light_pin = make_pin(config.LIGHT_ADC_PIN, pin_name=config.LIGHT_ADC_PIN_NAME)
-        light_adc = ADC(light_pin) if light_pin is not None else None
-    except Exception:
-        light_adc = None
+    light_adc = None
+    if not getattr(config, "GY302_ENABLE", True):
+        try:
+            light_pin = make_pin(config.LIGHT_ADC_PIN, pin_name=config.LIGHT_ADC_PIN_NAME)
+            light_adc = ADC(light_pin) if light_pin is not None else None
+        except Exception:
+            light_adc = None
     gnss = QuectelGNSS()
     temp_hum = SHT40(i2c, addr=config.SHT40_ADDR) if i2c is not None and config.SHT40_ENABLE else None
+    light_sensor = GY302(i2c, addr=config.GY302_ADDR) if i2c is not None and config.GY302_ENABLE else ADCLightSensor(light_adc)
     sensors = {
         "imu": IMU(i2c) if i2c is not None else None,
         "sht40": temp_hum,
         "jx90614": JX90614(i2c, config.JX90614_ADDR) if i2c is not None and config.JX90614_ENABLE else None,
         "max30100": MAX30100(i2c) if i2c is not None else None,
         "barometer": Barometer(i2c, addr=config.BAROMETER_ADDR) if i2c is not None and config.BAROMETER_ENABLE else None,
-        "light": LightSensor(light_adc),
+        "light": light_sensor,
         "gps": gnss if gnss.gnss is not None else GPSUART(gps_uart),
         "ultrasonic": Ultrasonic(trig, echo),
     }
