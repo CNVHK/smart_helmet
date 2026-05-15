@@ -212,11 +212,11 @@ class DataPacketBuilder:
     def _alert_level(self, warning):
         """把算法等级转换为协议 0-3 状态码。"""
         level = warning.get("level")
-        if level in ("severe", "sos"):
+        if level in ("severe", "sos", "danger", "high"):
             return 3
-        if level == "medium":
+        if level in ("medium", "warning"):
             return 2
-        if level in ("light", "suspected"):
+        if level in ("light", "suspected", "attention", "low", "mild"):
             return 1
         return 0
 

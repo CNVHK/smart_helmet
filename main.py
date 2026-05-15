@@ -1,7 +1,18 @@
-"""智能头盔主程序入口。"""
+"""SmartHelmet main entry point."""
 
+import sys
 import time
 import config
+
+try:
+    import os
+    _ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+except Exception:
+    _ROOT_DIR = ".."
+if _ROOT_DIR not in sys.path:
+    sys.path.append(_ROOT_DIR)
+
+from algorithms.algorithm_architecture import SmartHelmetAlgorithm, build_telemetry_event
 
 try:
     from machine import I2C, UART, Pin, ADC
@@ -23,16 +34,12 @@ from drivers.button import Button
 from core.sensor_manager import SensorManager
 from core.data_packet import DataPacketBuilder
 from core.system_status import SystemStatus
-from algorithms.collision_detector import CollisionDetector
-from algorithms.heat_detector import HeatDetector
-from algorithms.fatigue_detector import FatigueDetector
 from algorithms.distance_warning import DistanceWarning
 from communication.mqtt_client import HelmetMQTTClient
 from communication.uart_4g import G4Module
 
 
 def sleep_ms(ms):
-    """毫秒延时兼容函数。"""
     if hasattr(time, "sleep_ms"):
         time.sleep_ms(ms)
     else:
@@ -40,17 +47,232 @@ def sleep_ms(ms):
 
 
 def ticks_ms():
-    """毫秒计时兼容函数。"""
     return time.ticks_ms() if hasattr(time, "ticks_ms") else int(time.time() * 1000)
 
 
 def ticks_diff(now, old):
-    """计时差兼容函数。"""
     return time.ticks_diff(now, old) if hasattr(time, "ticks_diff") else now - old
 
 
+def now_s():
+    return int(time.time())
+
+
+def _field(data, key, default=None):
+    if not isinstance(data, dict):
+        return default
+    value = data.get(key)
+    return default if value is None else value
+
+
+def _gps_speed_mps(gps_data):
+    if not getattr(config, "GNSS_ENABLE", True):
+        return None
+    if not isinstance(gps_data, dict):
+        return None
+    speed = gps_data.get("speed")
+    if speed is not None:
+        return speed
+    speed_kmh = gps_data.get("speed_kmh")
+    if speed_kmh is not None:
+        return speed_kmh / 3.6
+    return None
+
+
+def _fmt(value, digits=2):
+    if value is None:
+        return "None"
+    try:
+        return str(round(float(value), digits))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _algorithm_debug_enabled():
+    return bool(getattr(config, "ALGORITHM_DEBUG_ENABLE", False))
+
+
+def _algorithm_debug_interval_ms():
+    return int(getattr(config, "ALGORITHM_DEBUG_INTERVAL_MS", 1000))
+
+
+def _print_algorithm_debug(sensor_data, result, warnings, force=False):
+    if not _algorithm_debug_enabled():
+        return
+    if not force and not bool(getattr(config, "ALGORITHM_DEBUG_PRINT_NORMAL", True)):
+        return
+
+    imu = sensor_data.get("imu") or {}
+    gps = sensor_data.get("gps") or {}
+    runtime = result.get("runtime_feature") or {}
+    collision = result.get("collision") or {}
+    pre_warning = result.get("pre_warning") or {}
+    fatigue = result.get("fatigue") or {}
+    heat = result.get("heat") or {}
+    safety = result.get("safety") or {}
+    response = result.get("response") or {}
+
+    print(
+        "[ALG] ts={ts} imu=({ax},{ay},{az};{gx},{gy},{gz}) gps={gps} "
+        "pitch={pitch} low_head={low_head}s nod={nod} motion={motion} "
+        "collision={ca}/{cl} reason={cr} acc_peak={ap} gyro_peak={gp} jerk_peak={jp} "
+        "pre={pa}/{pl} fatigue={fa}/{fl} heat={ha}/{hl} safety={score}/{status} response={resp}".format(
+            ts=result.get("timestamp"),
+            ax=_fmt(imu.get("ax")),
+            ay=_fmt(imu.get("ay")),
+            az=_fmt(imu.get("az")),
+            gx=_fmt(imu.get("gx")),
+            gy=_fmt(imu.get("gy")),
+            gz=_fmt(imu.get("gz")),
+            gps=_fmt(_gps_speed_mps(gps)),
+            pitch=_fmt(runtime.get("pitch_deg"), 1),
+            low_head=_fmt(runtime.get("low_head_seconds"), 1),
+            nod=runtime.get("nod_count_1min"),
+            motion=_fmt(runtime.get("motion_intensity")),
+            ca=collision.get("collision_alert"),
+            cl=collision.get("collision_level"),
+            cr=collision.get("reason"),
+            ap=_fmt(collision.get("acc_peak")),
+            gp=_fmt(collision.get("gyro_peak"), 1),
+            jp=_fmt(collision.get("jerk_peak")),
+            pa=pre_warning.get("risk_pre_alert"),
+            pl=pre_warning.get("risk_pre_level"),
+            fa=fatigue.get("fatigue_alert"),
+            fl=fatigue.get("fatigue_level"),
+            ha=heat.get("heat_alert"),
+            hl=heat.get("heat_level"),
+            score=safety.get("safety_score"),
+            status=safety.get("risk_status"),
+            resp=response.get("response_level"),
+        )
+    )
+
+    if warnings:
+        print("[ALG-WARN]", warnings)
+
+
+def _warning_rank(level):
+    return {
+        "normal": 0,
+        "safe": 0,
+        "attention": 1,
+        "low": 1,
+        "mild": 1,
+        "light": 1,
+        "suspected": 1,
+        "warning": 2,
+        "medium": 2,
+        "high": 3,
+        "danger": 3,
+        "severe": 4,
+        "sos": 5,
+    }.get(level, 0)
+
+
+def _buzzer_level(level):
+    if level == "sos":
+        return "sos"
+    if level in ("severe", "danger", "high"):
+        return "severe"
+    if level in ("warning", "medium"):
+        return "medium"
+    if level in ("attention", "low", "mild"):
+        return "light"
+    if level in ("light", "suspected"):
+        return level
+    return "suspected"
+
+
+def _warning_packet(device_id, warning, gps_data=None, packet_builder=None):
+    if warning and warning.get("category") in ("collision", "heat", "fatigue", "sos", "distance"):
+        packet = dict(warning)
+        packet["level"] = _buzzer_level(packet.get("level"))
+        if packet_builder is not None:
+            return packet_builder.build_event(packet, gps_data)
+        return packet
+    payload = {
+        "version": "1.4",
+        "device_id": device_id,
+        "msg_type": "event",
+        "timestamp": now_s(),
+        "event": warning.get("message") if warning else "alert",
+    }
+    if gps_data:
+        payload["gps"] = gps_data
+    if warning:
+        payload["algorithm_warning"] = warning
+    return payload
+
+
+def _algorithm_warnings(result):
+    warnings = []
+    if not result:
+        return warnings
+
+    collision = result.get("collision") or {}
+    if collision.get("collision_alert", 0) > 0 or collision.get("need_sos"):
+        warnings.append({
+            "triggered": True,
+            "code": collision.get("collision_alert", 0),
+            "level": collision.get("collision_level") or "severe",
+            "category": "collision",
+            "message": collision.get("reason") or "collision_detected",
+            "need_sos": bool(collision.get("need_sos")),
+            "raw": collision,
+        })
+
+    pre_warning = result.get("pre_warning") or {}
+    if pre_warning.get("risk_pre_alert", 0) > 0:
+        warnings.append({
+            "triggered": True,
+            "code": pre_warning.get("risk_pre_alert", 0),
+            "level": pre_warning.get("risk_pre_level") or "low",
+            "category": "riding_risk",
+            "message": "riding_risk_warning",
+            "need_sos": False,
+            "raw": pre_warning,
+        })
+
+    fatigue = result.get("fatigue") or {}
+    if fatigue.get("fatigue_alert", 0) > 0:
+        warnings.append({
+            "triggered": True,
+            "code": fatigue.get("fatigue_alert", 0),
+            "level": fatigue.get("fatigue_level") or "mild",
+            "category": "fatigue",
+            "message": fatigue.get("fatigue_action") or "fatigue_warning",
+            "need_sos": False,
+            "raw": fatigue,
+        })
+
+    heat = result.get("heat") or {}
+    if heat.get("heat_alert", 0) > 0:
+        warnings.append({
+            "triggered": True,
+            "code": heat.get("heat_alert", 0),
+            "level": heat.get("heat_level") or "attention",
+            "category": "heat",
+            "message": heat.get("heat_action") or "heat_warning",
+            "need_sos": False,
+            "raw": heat,
+        })
+
+    response = result.get("response") or {}
+    if response.get("response_level") == "emergency" or response.get("sos_alert", 0):
+        warnings.append({
+            "triggered": True,
+            "code": response.get("sos_alert", 2),
+            "level": "sos",
+            "category": "sos",
+            "message": "algorithm_emergency",
+            "need_sos": True,
+            "raw": response,
+        })
+
+    return warnings
+
+
 def make_i2c():
-    """兼容不同 MicroPython 固件的 I2C 构造方式。"""
     attempts = (
         lambda: I2C(config.I2C_ID, freq=config.I2C_FREQ),
         lambda: I2C(config.I2C_ID),
@@ -66,7 +288,6 @@ def make_i2c():
 
 
 def scan_i2c(i2c):
-    """扫描 I2C 设备，失败时返回空列表。"""
     if i2c is None or not hasattr(i2c, "scan"):
         return []
     try:
@@ -79,7 +300,6 @@ def scan_i2c(i2c):
 
 
 def make_uart(uart_id, baudrate, tx_pin, rx_pin):
-    """兼容不同 MicroPython 固件的 UART 构造方式。"""
     attempts = (
         lambda: UART(uart_id, baudrate),
         lambda: UART(uart_id, baudrate=baudrate),
@@ -96,7 +316,6 @@ def make_uart(uart_id, baudrate, tx_pin, rx_pin):
 
 
 def make_pin(pin_id, mode=None, pull=None, pin_name=None):
-    """创建 GPIO 引脚，失败时返回 None 进入降级模式。"""
     ids = []
     if pin_name is not None:
         ids.append(pin_name)
@@ -114,19 +333,23 @@ def make_pin(pin_id, mode=None, pull=None, pin_name=None):
 
 
 def build_hardware():
-    """初始化 I2C、UART、GPIO，并在失败时返回 None 以降级运行。"""
     if I2C is None:
         print("[MAIN] machine module not found, running in dry mode")
         return {}, None, None, None
     i2c = make_i2c()
-    i2c_devices = scan_i2c(i2c)
-    gps_uart = make_uart(config.GPS_UART_ID, config.GPS_BAUDRATE, config.GPS_TX_PIN, config.GPS_RX_PIN)
-    g4_uart = make_uart(config.G4_UART_ID, config.G4_BAUDRATE, config.G4_TX_PIN, config.G4_RX_PIN)
+    scan_i2c(i2c)
+    gps_uart = None
+    if getattr(config, "GNSS_ENABLE", True):
+        gps_uart = make_uart(config.GPS_UART_ID, config.GPS_BAUDRATE, config.GPS_TX_PIN, config.GPS_RX_PIN)
+    g4_uart = None
+    if getattr(config, "COMM_UPLOAD_ENABLE", True):
+        g4_uart = make_uart(config.G4_UART_ID, config.G4_BAUDRATE, config.G4_TX_PIN, config.G4_RX_PIN)
     buzzer_pin = make_pin(config.BUZZER_PIN, Pin.OUT, pin_name=config.BUZZER_PIN_NAME)
     sos_pin = make_pin(config.SOS_BUTTON_PIN, Pin.IN, getattr(Pin, "PULL_UP", None), config.SOS_BUTTON_PIN_NAME)
     cancel_pin = make_pin(config.CANCEL_BUTTON_PIN, Pin.IN, getattr(Pin, "PULL_UP", None), config.CANCEL_BUTTON_PIN_NAME)
     trig = make_pin(config.ULTRASONIC_TRIG_PIN, Pin.OUT, pin_name=config.ULTRASONIC_TRIG_PIN_NAME)
     echo = make_pin(config.ULTRASONIC_ECHO_PIN, Pin.IN, pin_name=config.ULTRASONIC_ECHO_PIN_NAME)
+
     light_adc = None
     if not getattr(config, "GY302_ENABLE", True):
         try:
@@ -134,7 +357,8 @@ def build_hardware():
             light_adc = ADC(light_pin) if light_pin is not None else None
         except Exception:
             light_adc = None
-    gnss = QuectelGNSS()
+
+    gnss = QuectelGNSS() if getattr(config, "GNSS_ENABLE", True) else None
     temp_hum = SHT40(i2c, addr=config.SHT40_ADDR) if i2c is not None and config.SHT40_ENABLE else None
     light_sensor = GY302(i2c, addr=config.GY302_ADDR) if i2c is not None and config.GY302_ENABLE else ADCLightSensor(light_adc)
     sensors = {
@@ -144,25 +368,26 @@ def build_hardware():
         "max30100": MAX30100(i2c) if i2c is not None else None,
         "barometer": Barometer(i2c, addr=config.BAROMETER_ADDR) if i2c is not None and config.BAROMETER_ENABLE else None,
         "light": light_sensor,
-        "gps": gnss if gnss.gnss is not None else GPSUART(gps_uart),
         "ultrasonic": Ultrasonic(trig, echo),
     }
+    if getattr(config, "GNSS_ENABLE", True):
+        sensors["gps"] = gnss if gnss is not None and gnss.gnss is not None else GPSUART(gps_uart)
     sensors = {name: sensor for name, sensor in sensors.items() if sensor is not None}
     buttons = {"sos": Button(sos_pin), "cancel": Button(cancel_pin)}
-    return sensors, Buzzer(buzzer_pin), buttons, G4Module(g4_uart)
+    g4 = G4Module(g4_uart) if getattr(config, "COMM_UPLOAD_ENABLE", True) else None
+    return sensors, Buzzer(buzzer_pin), buttons, g4
 
 
 def select_warning(warnings):
-    """从多个算法结果中选择最严重的一条。"""
-    rank = {"suspected": 1, "light": 2, "medium": 3, "severe": 4}
     triggered = [item for item in warnings if item and item.get("triggered")]
     if not triggered:
         return None
-    return sorted(triggered, key=lambda item: rank.get(item.get("level"), 0), reverse=True)[0]
+    return sorted(triggered, key=lambda item: _warning_rank(item.get("level")), reverse=True)[0]
 
 
 def upload_payload(payload, mqtt, g4, cache, warning=False):
-    """优先 MQTT 上传，失败时尝试 4G 透传，仍失败则缓存。"""
+    if not getattr(config, "COMM_UPLOAD_ENABLE", True):
+        return True
     ok = False
     if config.MQTT_ENABLE and mqtt is not None:
         ok = mqtt.publish_warning(payload) if warning else mqtt.publish_telemetry(payload)
@@ -176,7 +401,6 @@ def upload_payload(payload, mqtt, g4, cache, warning=False):
 
 
 def flush_cache(mqtt, g4, cache):
-    """通信恢复后补发缓存数据。"""
     kept = []
     for payload, warning in cache:
         ok = False
@@ -190,7 +414,6 @@ def flush_cache(mqtt, g4, cache):
 
 
 def main():
-    """主循环：采集、检测、封包、上传、本地报警。"""
     sensors, buzzer, buttons, g4 = build_hardware()
     manager = SensorManager(sensors)
     manager.init_all()
@@ -199,31 +422,59 @@ def main():
     if g4:
         g4.init()
 
-    mqtt = HelmetMQTTClient() if config.MQTT_ENABLE else None
+    comm_enabled = bool(getattr(config, "COMM_UPLOAD_ENABLE", True))
+    mqtt = HelmetMQTTClient() if comm_enabled and config.MQTT_ENABLE else None
     if mqtt:
         mqtt.connect()
 
     status = SystemStatus()
     status.set_network("mqtt" if mqtt and mqtt.connected else "4g")
     packet_builder = DataPacketBuilder(config.DEVICE_ID)
-    collision = CollisionDetector()
-    heat = HeatDetector()
-    fatigue = FatigueDetector()
+    algorithm = SmartHelmetAlgorithm(sample_rate=max(1, int(1000 / max(1, config.SENSOR_UPDATE_MS))))
     distance = DistanceWarning()
     cache = []
     last_upload = ticks_ms()
     last_heartbeat = ticks_ms()
+    last_algorithm_debug = ticks_ms()
+    boot_ms = ticks_ms()
 
     print("[MAIN] smart helmet started")
     while True:
         try:
             sensor_data = manager.read_all()
-            warnings = [
-                collision.update(sensor_data.get("imu"), config.SENSOR_UPDATE_MS / 1000.0),
-                heat.update(sensor_data.get("sht40")),
-                fatigue.update(sensor_data),
-                distance.update(sensor_data.get("ultrasonic")),
-            ]
+            imu_data = sensor_data.get("imu") or {}
+            gps_data = sensor_data.get("gps") or {}
+            sht_data = sensor_data.get("sht40") or {}
+            jx_data = sensor_data.get("jx90614") or {}
+            usage_minutes = max(0, ticks_diff(ticks_ms(), boot_ms) // 60000)
+
+            algorithm_result = algorithm.update(
+                ax=_field(imu_data, "ax"),
+                ay=_field(imu_data, "ay"),
+                az=_field(imu_data, "az", 1.0),
+                gx=_field(imu_data, "gx"),
+                gy=_field(imu_data, "gy"),
+                gz=_field(imu_data, "gz"),
+                gps_speed=_gps_speed_mps(gps_data),
+                timestamp=now_s(),
+                body_temp=_field(jx_data, "body_temp"),
+                env_temp=_field(sht_data, "temperature"),
+                humidity=_field(sht_data, "humidity"),
+                usage_minutes=usage_minutes,
+                exposure_minutes=usage_minutes,
+                work_minutes=usage_minutes,
+                battery_level=status.battery,
+                signal_level=status.signal,
+                worn=bool(status.helmet_on),
+                location_valid=True if not getattr(config, "GNSS_ENABLE", True) else bool(gps_data.get("valid")),
+            )
+
+            status.work_time = usage_minutes
+            status.set_status(algorithm_result.get("safety", {}).get("risk_status", "normal"))
+
+            warnings = _algorithm_warnings(algorithm_result)
+            warnings.append(distance.update(sensor_data.get("ultrasonic")))
+
             if buttons.get("sos") and buttons["sos"].is_pressed():
                 warnings.append({
                     "triggered": True,
@@ -238,14 +489,28 @@ def main():
                 buzzer.off()
 
             alerts = packet_builder.alerts_from_warnings(warnings)
+            active_warnings = [item for item in warnings if item and item.get("triggered")]
+            if _algorithm_debug_enabled():
+                now_ms = ticks_ms()
+                debug_due = ticks_diff(now_ms, last_algorithm_debug) >= _algorithm_debug_interval_ms()
+                if debug_due or active_warnings:
+                    _print_algorithm_debug(sensor_data, algorithm_result, active_warnings, force=bool(active_warnings))
+                    last_algorithm_debug = now_ms
+
+            if getattr(config, "ALGORITHM_DEBUG_ONLY", False):
+                sleep_ms(config.SENSOR_UPDATE_MS)
+                continue
+
             telemetry = packet_builder.build_data(sensor_data, status.to_dict(), alerts)
+            telemetry["algorithm"] = algorithm_result
+            telemetry["algorithm_report"] = build_telemetry_event(config.DEVICE_ID, algorithm_result, gps=gps_data)
             warning = select_warning(warnings)
 
             if warning:
-                warning_packet = packet_builder.build_event(warning, sensor_data.get("gps"))
+                warning_packet = _warning_packet(config.DEVICE_ID, warning, gps_data, packet_builder)
                 upload_payload(warning_packet, mqtt, g4, cache, warning=True)
                 if buzzer:
-                    buzzer.alert(warning.get("level"))
+                    buzzer.alert(_buzzer_level(warning.get("level")))
 
             if ticks_diff(ticks_ms(), last_upload) >= config.UPLOAD_INTERVAL_MS:
                 upload_payload(telemetry, mqtt, g4, cache, warning=False)
