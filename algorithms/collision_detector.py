@@ -357,16 +357,8 @@ class HelmetCollisionDetector:
         # =========================
         # 窗口内保存当前帧特征。
         # 后续通过窗口统计峰值、均值，而不是只看单个点。
-        self.window.append({
-            "a_g": a_g,
-            "gyro": gyro,
-            "jerk": jerk,
-
-            # 保存滤波后的三轴加速度，用于碰撞后判断摔倒方向
-            "ax": ax_f,
-            "ay": ay_f,
-            "az": az_f
-        })
+        # 元组比 dict 更省内存，也能减少 MicroPython 长时间运行时的堆碎片。
+        self.window.append((a_g, gyro, jerk, ax_f, ay_f, az_f))
 
         # =========================
         # 6. 统计窗口特征
@@ -580,24 +572,39 @@ class HelmetCollisionDetector:
                 "az_avg": 1.0
             }
 
-        acc = [item["a_g"] for item in self.window]
-        gyro = [item["gyro"] for item in self.window]
-        jerk = [item["jerk"] for item in self.window]
+        count = 0
+        acc_peak = 0.0
+        gyro_peak = 0.0
+        jerk_peak = 0.0
+        acc_sum = 0.0
+        gyro_sum = 0.0
+        ax_sum = 0.0
+        ay_sum = 0.0
+        az_sum = 0.0
 
-        ax_list = [item["ax"] for item in self.window]
-        ay_list = [item["ay"] for item in self.window]
-        az_list = [item["az"] for item in self.window]
+        for a_g, gyro, jerk, ax, ay, az in self.window:
+            count += 1
+            if a_g > acc_peak:
+                acc_peak = a_g
+            if gyro > gyro_peak:
+                gyro_peak = gyro
+            if jerk > jerk_peak:
+                jerk_peak = jerk
+            acc_sum += a_g
+            gyro_sum += gyro
+            ax_sum += ax
+            ay_sum += ay
+            az_sum += az
 
         return {
-            "acc_peak": max(acc),
-            "gyro_peak": max(gyro),
-            "jerk_peak": max(jerk),
-            "acc_avg": sum(acc) / len(acc),
-            "gyro_avg": sum(gyro) / len(gyro),
-
-            "ax_avg": sum(ax_list) / len(ax_list),
-            "ay_avg": sum(ay_list) / len(ay_list),
-            "az_avg": sum(az_list) / len(az_list)
+            "acc_peak": acc_peak,
+            "gyro_peak": gyro_peak,
+            "jerk_peak": jerk_peak,
+            "acc_avg": acc_sum / count,
+            "gyro_avg": gyro_sum / count,
+            "ax_avg": ax_sum / count,
+            "ay_avg": ay_sum / count,
+            "az_avg": az_sum / count
         }
 
     def _estimate_fall_direction(self, stats):

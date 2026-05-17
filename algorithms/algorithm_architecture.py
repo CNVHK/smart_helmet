@@ -80,7 +80,7 @@ class RuntimeFeatureTracker:
     - 粗略运动强度
     """
 
-    def __init__(self, sample_rate=100, history_seconds=60):
+    def __init__(self, sample_rate=100, history_seconds=12):
         self.sample_rate = sample_rate
         self.maxlen = max(1, int(sample_rate * history_seconds))
         self.history = _make_deque(self.maxlen)
@@ -89,7 +89,7 @@ class RuntimeFeatureTracker:
         self.last_pitch = None
         self.last_pitch_trend = 0
         self.nod_count_1min = 0
-        self.nod_events = _make_deque(self.maxlen)
+        self.nod_events = _make_deque(max(10, int(sample_rate * 60)))
 
     def update(self, ax, ay, az, gx, gy, gz, gps_speed=None, timestamp=None):
         # 逻辑骨架：
@@ -123,13 +123,7 @@ class RuntimeFeatureTracker:
 
         self._update_nod_count(now, pitch)
 
-        self.history.append({
-            "timestamp": now,
-            "pitch": pitch,
-            "gyro_norm": gyro_norm,
-            "acc_norm": acc_norm,
-            "gps_speed": gps_speed,
-        })
+        self.history.append((now, pitch, gyro_norm, acc_norm, gps_speed))
 
         stats = self._recent_stats(seconds=10, now=now)
         speed_variation = stats["speed_range"]
@@ -177,21 +171,20 @@ class RuntimeFeatureTracker:
         speed_max = None
 
         for item in self.history:
-            if item["timestamp"] < cutoff:
+            item_time, _pitch, gyro_norm, acc_norm, gps_speed = item
+            if item_time < cutoff:
                 continue
             count += 1
-            gyro_sum += item["gyro_norm"]
-            acc = item["acc_norm"]
-            if acc_min is None or acc < acc_min:
-                acc_min = acc
-            if acc_max is None or acc > acc_max:
-                acc_max = acc
-            speed = item["gps_speed"]
-            if speed is not None:
-                if speed_min is None or speed < speed_min:
-                    speed_min = speed
-                if speed_max is None or speed > speed_max:
-                    speed_max = speed
+            gyro_sum += gyro_norm
+            if acc_min is None or acc_norm < acc_min:
+                acc_min = acc_norm
+            if acc_max is None or acc_norm > acc_max:
+                acc_max = acc_norm
+            if gps_speed is not None:
+                if speed_min is None or gps_speed < speed_min:
+                    speed_min = gps_speed
+                if speed_max is None or gps_speed > speed_max:
+                    speed_max = gps_speed
 
         return {
             "avg_gyro": gyro_sum / count if count else 0.0,
@@ -203,7 +196,16 @@ class RuntimeFeatureTracker:
         """返回最近 seconds 秒的历史窗口，避免多处重复切片和边界计算。"""
 
         count = min(len(self.history), max(1, int(self.sample_rate * seconds)))
-        return list(self.history)[-count:]
+        if count <= 0:
+            return []
+        result = []
+        start = len(self.history) - count
+        index = 0
+        for item in self.history:
+            if index >= start:
+                result.append(item)
+            index += 1
+        return result
 
     def _range(self, values):
         if not values:

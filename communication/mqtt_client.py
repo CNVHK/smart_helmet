@@ -37,21 +37,15 @@ class HelmetMQTTClient:
         self.client = None
         self.last_connect_attempt = 0
         self.last_publish_failure = 0
-        if MQTTClient is not None:
-            self.client = MQTTClient(
-                client_id=config.MQTT_CLIENT_ID,
-                server=config.MQTT_BROKER,
-                port=config.MQTT_PORT,
-                user=config.MQTT_USERNAME,
-                password=config.MQTT_PASSWORD,
-                keepalive=60,
-            )
+        self._new_client()
 
     def connect(self):
         """连接 MQTT Broker。"""
-        if self.client is None:
+        if MQTTClient is None:
             print("[MQTT] umqtt not found")
             return False
+        if self.client is None:
+            self._new_client()
         now = self._ticks_ms()
         reconnect_ms = getattr(config, "MQTT_RECONNECT_INTERVAL_MS", 30000)
         if self.last_connect_attempt and self._ticks_diff(now, self.last_connect_attempt) < reconnect_ms:
@@ -120,6 +114,10 @@ class HelmetMQTTClient:
             self.connected = False
             self.last_publish_failure = self._ticks_ms()
             self._safe_disconnect()
+            data = None
+            data_bytes = None
+            if gc:
+                gc.collect()
             return False
 
     def _safe_disconnect(self):
@@ -129,11 +127,32 @@ class HelmetMQTTClient:
                 self.client.disconnect()
         except Exception:
             pass
+        self.client = None
+        self.connected = False
+        if gc:
+            gc.collect()
+
+    def _new_client(self):
+        """创建新的 MQTTClient，避免失败后的底层 socket 被长期复用。"""
+        if MQTTClient is None:
+            self.client = None
+            return None
+        self.client = MQTTClient(
+            client_id=config.MQTT_CLIENT_ID,
+            server=config.MQTT_BROKER,
+            port=config.MQTT_PORT,
+            user=config.MQTT_USERNAME,
+            password=config.MQTT_PASSWORD,
+            keepalive=getattr(config, "MQTT_KEEPALIVE", 30),
+        )
+        return self.client
 
     def _connect_client(self):
         broker = config.MQTT_BROKER
         if not self._is_ipv4(broker) or socket is None or not hasattr(socket, "getaddrinfo"):
-            return self.client.connect()
+            result = self.client.connect()
+            self._set_socket_timeout()
+            return result
 
         original_getaddrinfo = socket.getaddrinfo
 
@@ -146,9 +165,21 @@ class HelmetMQTTClient:
 
         socket.getaddrinfo = direct_ip_getaddrinfo
         try:
-            return self.client.connect()
+            result = self.client.connect()
+            self._set_socket_timeout()
+            return result
         finally:
             socket.getaddrinfo = original_getaddrinfo
+
+    def _set_socket_timeout(self):
+        """限制 publish 阻塞时间，避免网络异常时主循环长时间卡死。"""
+        timeout = getattr(config, "MQTT_SOCKET_TIMEOUT_S", 8)
+        try:
+            sock = getattr(self.client, "sock", None)
+            if sock is not None and hasattr(sock, "settimeout"):
+                sock.settimeout(timeout)
+        except Exception:
+            pass
 
     def _is_ipv4(self, value):
         if not isinstance(value, str):
