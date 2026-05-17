@@ -9,7 +9,10 @@ except ImportError:
 def encode_json(payload):
     """把 dict 安全编码为 JSON 字符串，失败返回 None。"""
     try:
-        return json.dumps(payload)
+        try:
+            return json.dumps(payload, separators=(",", ":"))
+        except TypeError:
+            return json.dumps(payload)
     except Exception as exc:
         print("[Protocol] json encode failed:", exc)
         return None

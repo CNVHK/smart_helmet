@@ -90,7 +90,7 @@ class HelmetMQTTClient:
         if not self.connected and not self.connect():
             return False
         try:
-            data = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+            data = self._dumps(payload) if isinstance(payload, dict) else str(payload)
             topic_bytes = topic if isinstance(topic, bytes) else topic.encode()
             data_bytes = data if isinstance(data, bytes) else data.encode()
             self.client.publish(topic_bytes, data_bytes)
@@ -108,6 +108,12 @@ class HelmetMQTTClient:
                 self.client.disconnect()
         except Exception:
             pass
+
+    def _dumps(self, payload):
+        try:
+            return json.dumps(payload, separators=(",", ":"))
+        except TypeError:
+            return json.dumps(payload)
 
     def _ticks_ms(self):
         return time.ticks_ms() if hasattr(time, "ticks_ms") else int(time.time() * 1000)

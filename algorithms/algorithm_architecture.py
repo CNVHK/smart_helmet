@@ -482,6 +482,85 @@ class HeatRiskDetector:
         }
 
 
+class VitalSignRiskDetector:
+    """Lightweight risk scoring for the currently available vital sensors."""
+
+    def update(self, body_temp=None, heart_rate=None, spo2=None):
+        score = 0
+        reasons = []
+        body_temp_alert = 0
+        hr_alert = 0
+        spo2_alert = 0
+
+        if body_temp is not None:
+            if body_temp >= 39.0:
+                body_temp_alert = 3
+                score += 35
+                reasons.append("body_temp_danger")
+            elif body_temp >= 38.0:
+                body_temp_alert = 2
+                score += 22
+                reasons.append("body_temp_warning")
+            elif body_temp >= 37.3:
+                body_temp_alert = 1
+                score += 10
+                reasons.append("body_temp_rise")
+
+        if heart_rate is not None:
+            if heart_rate < 45 or heart_rate > 130:
+                hr_alert = 3
+                score += 30
+                reasons.append("heart_rate_danger")
+            elif heart_rate < 55 or heart_rate > 110:
+                hr_alert = 2
+                score += 18
+                reasons.append("heart_rate_warning")
+            elif heart_rate > 100:
+                hr_alert = 1
+                score += 8
+                reasons.append("heart_rate_rise")
+
+        if spo2 is not None:
+            if spo2 < 90:
+                spo2_alert = 3
+                score += 35
+                reasons.append("spo2_danger")
+            elif spo2 < 94:
+                spo2_alert = 2
+                score += 22
+                reasons.append("spo2_warning")
+            elif spo2 < 96:
+                spo2_alert = 1
+                score += 10
+                reasons.append("spo2_attention")
+
+        score = _clamp(score)
+        max_alert = max(body_temp_alert, hr_alert, spo2_alert)
+        if max_alert >= 3:
+            level = "danger"
+            action = "notify_health_risk"
+        elif max_alert == 2:
+            level = "warning"
+            action = "health_warning"
+        elif max_alert == 1:
+            level = "attention"
+            action = "record_and_remind"
+        else:
+            level = "safe"
+            action = "none"
+
+        return {
+            "vital_score": score,
+            "vital_level": level,
+            "vital_alert": max_alert,
+            "body_temp_alert": body_temp_alert,
+            "hr_alert": hr_alert,
+            "spo2_alert": spo2_alert,
+            "vital_action": action,
+            "vital_reasons": reasons or ["safe"],
+        }
+
+
 class SafetyScoreEngine:
     """
     综合安全评分。
@@ -495,6 +574,7 @@ class SafetyScoreEngine:
         collision,
         fatigue,
         heat,
+        vital=None,
         battery_level=None,
         signal_level=None,
         worn=True,
@@ -535,6 +615,11 @@ class SafetyScoreEngine:
         if heat.get("heat_alert", 0) > 0:
             risks.append("heat")
 
+        vital = vital or {}
+        score -= vital.get("vital_alert", 0) * 10
+        if vital.get("vital_alert", 0) > 0:
+            risks.append("vital")
+
         if battery_level is not None and battery_level < 20:
             score -= 8
             risks.append("low_battery")
@@ -558,6 +643,7 @@ class SafetyScoreEngine:
             or collision_alert >= 3
             or fatigue.get("fatigue_alert", 0) >= 3
             or heat.get("heat_alert", 0) >= 3
+            or vital.get("vital_alert", 0) >= 3
         )
 
         if force_danger or score < 50:
@@ -681,6 +767,7 @@ class SmartHelmetAlgorithm:
         self.pre_warning = RidingRiskPreWarning()
         self.fatigue_detector = FatigueDetector()
         self.heat_detector = HeatRiskDetector()
+        self.vital_detector = VitalSignRiskDetector()
         self.safety_engine = SafetyScoreEngine()
         self.response_engine = AccidentResponseEngine()
 
@@ -695,6 +782,8 @@ class SmartHelmetAlgorithm:
         gps_speed=None,
         timestamp=None,
         body_temp=None,
+        heart_rate=None,
+        spo2=None,
         env_temp=None,
         humidity=None,
         usage_minutes=0,
@@ -762,11 +851,18 @@ class SmartHelmetAlgorithm:
             strong_sun=strong_sun,
         )
 
+        vital = self.vital_detector.update(
+            body_temp=body_temp,
+            heart_rate=heart_rate,
+            spo2=spo2,
+        )
+
         safety = self.safety_engine.update(
             pre_warning=pre_warning,
             collision=collision,
             fatigue=fatigue,
             heat=heat,
+            vital=vital,
             battery_level=battery_level,
             signal_level=signal_level,
             worn=worn,
@@ -789,6 +885,7 @@ class SmartHelmetAlgorithm:
             "collision": collision,
             "fatigue": fatigue,
             "heat": heat,
+            "vital": vital,
             "safety": safety,
             "response": response,
         }
@@ -838,6 +935,7 @@ def build_telemetry_event(device_id, result, gps=None):
         },
         "fatigue": result["fatigue"],
         "heat": result["heat"],
+        "vital": result.get("vital"),
     }
 
     if gps:

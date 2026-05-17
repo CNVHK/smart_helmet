@@ -19,11 +19,11 @@ class DataPacketBuilder:
         """保存头盔设备 ID。"""
         self.helmet_id = helmet_id
 
-    def build_data(self, sensor_data, system_data=None, alerts=None):
+    def build_data(self, sensor_data, system_data=None, alerts=None, algorithm=None):
         """根据 SensorManager 输出构造 msg_type=data 常规数据包。"""
         system_data = system_data or {}
         alerts = alerts or {}
-        return {
+        payload = {
             "version": "1.2",
             "device_id": self.helmet_id,
             "msg_type": "data",
@@ -53,10 +53,14 @@ class DataPacketBuilder:
                 "spo2_alert": alerts.get("spo2_alert", 0),
             },
         }
+        algorithm_payload = self._algorithm(algorithm)
+        if algorithm_payload is not None:
+            payload["algorithm"] = algorithm_payload
+        return payload
 
-    def build_telemetry(self, sensor_data, system_data=None, alerts=None):
+    def build_telemetry(self, sensor_data, system_data=None, alerts=None, algorithm=None):
         """兼容旧调用名，实际返回协议 v1.1 data 包。"""
-        return self.build_data(sensor_data, system_data, alerts)
+        return self.build_data(sensor_data, system_data, alerts, algorithm)
 
     def build_heartbeat(self, system_data=None):
         """构造 msg_type=heartbeat 心跳包。"""
@@ -92,6 +96,12 @@ class DataPacketBuilder:
             payload["sos_alert"] = 1 if event.get("need_sos", True) else self._alert_level(event)
         elif category == "fatigue":
             payload["fatigue_alert"] = self._alert_level(event)
+        elif category == "body_temp":
+            payload["body_temp_alert"] = self._alert_level(event)
+        elif category == "heart_rate":
+            payload["hr_alert"] = self._alert_level(event)
+        elif category == "spo2":
+            payload["spo2_alert"] = self._alert_level(event)
         payload["gps"] = {
             "lat": self._gps_lat(gps_data),
             "lon": self._gps_lon(gps_data),
@@ -168,6 +178,69 @@ class DataPacketBuilder:
             "fix": self._gps_fix(data),
         }
 
+    def _algorithm(self, data):
+        if not isinstance(data, dict):
+            return None
+        collision = data.get("collision") or {}
+        runtime = data.get("runtime_feature") or {}
+        safety = data.get("safety") or {}
+        response = data.get("response") or {}
+        pre_warning = data.get("pre_warning") or {}
+        fatigue = data.get("fatigue") or {}
+        heat = data.get("heat") or {}
+        vital = data.get("vital") or {}
+        return {
+            "version": data.get("version"),
+            "timestamp": data.get("timestamp"),
+            "safety": {
+                "score": safety.get("safety_score"),
+                "status": safety.get("risk_status"),
+                "main": safety.get("main_risk_type"),
+            },
+            "response": {
+                "level": response.get("response_level"),
+                "sos": response.get("sos_alert"),
+            },
+            "runtime": {
+                "pitch": runtime.get("pitch_deg"),
+                "low_head_s": runtime.get("low_head_seconds"),
+                "nod_1min": runtime.get("nod_count_1min"),
+                "motion": runtime.get("motion_intensity"),
+            },
+            "pre": {
+                "score": pre_warning.get("risk_pre_score"),
+                "level": pre_warning.get("risk_pre_level"),
+                "alert": pre_warning.get("risk_pre_alert"),
+            },
+            "fatigue": {
+                "score": fatigue.get("fatigue_score"),
+                "level": fatigue.get("fatigue_level"),
+                "alert": fatigue.get("fatigue_alert"),
+            },
+            "heat": {
+                "score": heat.get("heat_score"),
+                "level": heat.get("heat_level"),
+                "alert": heat.get("heat_alert"),
+            },
+            "vital": {
+                "score": vital.get("vital_score"),
+                "level": vital.get("vital_level"),
+                "alert": vital.get("vital_alert"),
+                "body_temp": vital.get("body_temp_alert"),
+                "hr": vital.get("hr_alert"),
+                "spo2": vital.get("spo2_alert"),
+            },
+            "collision": {
+                "alert": collision.get("collision_alert"),
+                "level": collision.get("collision_level"),
+                "type": collision.get("accident_type"),
+                "fall": collision.get("fall_detected"),
+                "direction": collision.get("fall_direction"),
+                "sos": collision.get("need_sos"),
+                "reason": collision.get("reason"),
+            },
+        }
+
     def _vital(self, sensor_data):
         """整理 v1.2 人体健康字段。"""
         body = sensor_data.get("jx90614") or {}
@@ -230,7 +303,10 @@ class DataPacketBuilder:
 
     def dumps(self, payload):
         """把数据包序列化为 JSON 字符串。"""
-        return json.dumps(payload)
+        try:
+            return json.dumps(payload, separators=(",", ":"))
+        except TypeError:
+            return json.dumps(payload)
 
     def _get(self, root, section, key):
         data = root.get(section)
