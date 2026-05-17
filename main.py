@@ -38,6 +38,7 @@ from drivers.button import Button
 from core.sensor_manager import SensorManager
 from core.data_packet import DataPacketBuilder
 from core.system_status import SystemStatus
+from algorithms.collision_detector import HelmetCollisionDetector
 from algorithms.distance_warning import DistanceWarning
 from communication.mqtt_client import HelmetMQTTClient
 from communication.uart_4g import G4Module
@@ -347,6 +348,37 @@ def _algorithm_warnings(result):
     return warnings
 
 
+def _collision_warning(result):
+    if not result:
+        return None
+    if result.get("collision_alert", 0) <= 0 and not result.get("need_sos"):
+        return None
+    return {
+        "triggered": True,
+        "code": result.get("collision_alert", 0),
+        "level": result.get("collision_level") or "severe",
+        "category": "collision",
+        "message": result.get("reason") or "collision_detected",
+        "need_sos": bool(result.get("need_sos")),
+        "raw": result,
+    }
+
+
+def _normal_algorithm_result(timestamp):
+    return {
+        "version": "1.2",
+        "timestamp": int(timestamp),
+        "runtime_feature": {},
+        "pre_warning": {"risk_pre_alert": 0, "risk_pre_level": "normal"},
+        "collision": {"collision_alert": 0, "collision_level": "normal", "need_sos": False},
+        "fatigue": {"fatigue_alert": 0, "fatigue_level": "normal"},
+        "heat": {"heat_alert": 0, "heat_level": "safe"},
+        "vital": {"vital_alert": 0, "vital_level": "safe"},
+        "safety": {"safety_score": 100, "risk_status": "safe", "main_risk_type": "none"},
+        "response": {"response_level": "none", "sos_alert": 0},
+    }
+
+
 def make_i2c():
     attempts = (
         lambda: I2C(config.I2C_ID, freq=config.I2C_FREQ),
@@ -540,14 +572,18 @@ def main():
     status = SystemStatus()
     status.set_network("mqtt" if mqtt and mqtt.connected else "4g")
     packet_builder = DataPacketBuilder(config.DEVICE_ID)
-    algorithm = SmartHelmetAlgorithm(sample_rate=max(1, int(1000 / max(1, config.SENSOR_UPDATE_MS))))
+    sample_rate = max(1, int(1000 / max(1, config.SENSOR_UPDATE_MS)))
+    algorithm = SmartHelmetAlgorithm(sample_rate=sample_rate)
+    collision_detector = HelmetCollisionDetector(sample_rate=sample_rate)
     distance = DistanceWarning()
     cache = []
     last_upload = ticks_ms()
     last_heartbeat = ticks_ms()
     last_algorithm_debug = ticks_ms()
+    last_algorithm_full = 0
     last_cache_flush = ticks_ms()
     last_warning_upload = {}
+    algorithm_result = None
     boot_ms = ticks_ms()
 
     print("[MAIN] smart helmet started")
@@ -562,34 +598,58 @@ def main():
             light_data = sensor_data.get("light") or {}
             usage_minutes = max(0, ticks_diff(ticks_ms(), boot_ms) // 60000)
 
-            algorithm_result = algorithm.update(
-                ax=_field(imu_data, "ax"),
-                ay=_field(imu_data, "ay"),
-                az=_field(imu_data, "az", 1.0),
-                gx=_field(imu_data, "gx"),
-                gy=_field(imu_data, "gy"),
-                gz=_field(imu_data, "gz"),
+            now_timestamp = now_s()
+            collision_result = collision_detector.update(
+                _field(imu_data, "ax"),
+                _field(imu_data, "ay"),
+                _field(imu_data, "az", 1.0),
+                _field(imu_data, "gx"),
+                _field(imu_data, "gy"),
+                _field(imu_data, "gz"),
                 gps_speed=_gps_speed_mps(gps_data),
-                timestamp=now_s(),
-                body_temp=_field(jx_data, "body_temp"),
-                heart_rate=_valid_vital(max_data, "hr", "hr_valid"),
-                spo2=_valid_vital(max_data, "spo2", "spo2_valid"),
-                env_temp=_field(sht_data, "temperature"),
-                humidity=_field(sht_data, "humidity"),
-                usage_minutes=usage_minutes,
-                exposure_minutes=usage_minutes,
-                work_minutes=usage_minutes,
-                battery_level=status.battery,
-                signal_level=status.signal,
-                worn=bool(status.helmet_on),
-                location_valid=True if not getattr(config, "GNSS_ENABLE", True) else bool(gps_data.get("valid")),
-                strong_sun=_strong_sun(light_data),
+                timestamp=now_timestamp,
             )
+            collision_result["accident_type"] = algorithm._classify_accident_type(collision_result)
+
+            full_due = (
+                algorithm_result is None
+                or ticks_diff(ticks_ms(), last_algorithm_full) >= getattr(config, "ALGORITHM_FULL_INTERVAL_MS", 1000)
+            )
+            if full_due:
+                algorithm_result = algorithm.update(
+                    ax=_field(imu_data, "ax"),
+                    ay=_field(imu_data, "ay"),
+                    az=_field(imu_data, "az", 1.0),
+                    gx=_field(imu_data, "gx"),
+                    gy=_field(imu_data, "gy"),
+                    gz=_field(imu_data, "gz"),
+                    gps_speed=_gps_speed_mps(gps_data),
+                    timestamp=now_timestamp,
+                    body_temp=_field(jx_data, "body_temp"),
+                    heart_rate=_valid_vital(max_data, "hr", "hr_valid"),
+                    spo2=_valid_vital(max_data, "spo2", "spo2_valid"),
+                    env_temp=_field(sht_data, "temperature"),
+                    humidity=_field(sht_data, "humidity"),
+                    usage_minutes=usage_minutes,
+                    exposure_minutes=usage_minutes,
+                    work_minutes=usage_minutes,
+                    battery_level=status.battery,
+                    signal_level=status.signal,
+                    worn=bool(status.helmet_on),
+                    location_valid=True if not getattr(config, "GNSS_ENABLE", True) else bool(gps_data.get("valid")),
+                    strong_sun=_strong_sun(light_data),
+                )
+                last_algorithm_full = ticks_ms()
+            if algorithm_result is None:
+                algorithm_result = _normal_algorithm_result(now_timestamp)
 
             status.work_time = usage_minutes
             status.set_status(algorithm_result.get("safety", {}).get("risk_status", "normal"))
 
             warnings = _algorithm_warnings(algorithm_result)
+            fast_collision_warning = _collision_warning(collision_result)
+            if fast_collision_warning:
+                warnings.append(fast_collision_warning)
             warnings.append(distance.update(sensor_data.get("ultrasonic")))
 
             if buttons.get("sos") and buttons["sos"].is_pressed():

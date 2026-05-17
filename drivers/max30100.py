@@ -64,8 +64,10 @@ class MAX30100:
         self.addr = addr
         self.led_config = led_config
         self._available = i2c is not None
-        self.ir_buffer = []
-        self.red_buffer = []
+        self.ir_buffer = [0] * BUFFER_SIZE
+        self.red_buffer = [0] * BUFFER_SIZE
+        self.buffer_index = 0
+        self.buffer_len = 0
         self.last_sample_ms = _ticks_ms()
         self.last_hr = None
         self.last_spo2 = None
@@ -104,8 +106,7 @@ class MAX30100:
         if not self._available:
             return self._result(False, None, "max30100_not_available")
         try:
-            samples = self._read_all_samples()
-            self._append_samples(samples)
+            self._read_all_samples()
             hr = self._estimate_hr()
             spo2 = self._estimate_spo2()
             contact = self._estimate_contact()
@@ -153,44 +154,51 @@ class MAX30100:
     def _read_all_samples(self):
         """读取当前 FIFO 中所有样本。"""
         count = self._fifo_available()
-        samples = []
+        read_count = 0
         for _ in range(count):
             raw = self._read_regs(REG_FIFO_DATA, 4)
             ir = (raw[0] << 8) | raw[1]
             red = (raw[2] << 8) | raw[3]
-            samples.append((ir, red))
+            self._append_sample(ir, red)
+            read_count += 1
         if count >= FIFO_DEPTH:
             self._write_reg(REG_OVF_COUNTER, 0x00)
-        if samples:
-            ir, red = samples[-1]
-            self.last_raw = {"ir": ir, "red": red, "count": len(samples)}
-        return samples
+        if read_count:
+            self.last_raw = {"ir": ir, "red": red, "count": read_count}
+        return read_count
 
-    def _append_samples(self, samples):
-        """把新样本放入固定长度缓存。"""
-        for ir, red in samples:
-            self.ir_buffer.append(ir)
-            self.red_buffer.append(red)
-        while len(self.ir_buffer) > BUFFER_SIZE:
-            self.ir_buffer.pop(0)
-        while len(self.red_buffer) > BUFFER_SIZE:
-            self.red_buffer.pop(0)
+    def _append_sample(self, ir, red):
+        """把新样本写入固定长度环形缓存。"""
+        self.ir_buffer[self.buffer_index] = ir
+        self.red_buffer[self.buffer_index] = red
+        self.buffer_index = (self.buffer_index + 1) % BUFFER_SIZE
+        if self.buffer_len < BUFFER_SIZE:
+            self.buffer_len += 1
+
+    def _recent_start(self, count):
+        """返回最近 count 个样本中最旧样本的环形下标。"""
+        return (self.buffer_index - count) % BUFFER_SIZE
+
+    def _idx(self, start, offset):
+        """把顺序窗口 offset 转成环形缓存下标。"""
+        return (start + offset) % BUFFER_SIZE
 
     def _estimate_contact(self):
         """根据 DC 强度和波动粗略判断是否接触。"""
-        if len(self.ir_buffer) < 10:
+        if self.buffer_len < 10:
             return 0
-        start = max(0, len(self.ir_buffer) - 30)
-        count = len(self.ir_buffer) - start
+        count = min(30, self.buffer_len)
+        start = self._recent_start(count)
         ir_sum = 0
         red_sum = 0
         ir_min = None
         ir_max = None
         red_min = None
         red_max = None
-        for i in range(start, len(self.ir_buffer)):
-            ir = self.ir_buffer[i]
-            red = self.red_buffer[i]
+        for i in range(count):
+            idx = self._idx(start, i)
+            ir = self.ir_buffer[idx]
+            red = self.red_buffer[idx]
             ir_sum += ir
             red_sum += red
             if ir_min is None or ir < ir_min:
@@ -209,18 +217,17 @@ class MAX30100:
 
     def _estimate_hr(self):
         """用 IR 波形局部峰值估算心率。"""
-        values = self.ir_buffer
-        if len(values) < SAMPLE_RATE_HZ * 2:
+        if self.buffer_len < SAMPLE_RATE_HZ * 2:
             return None
-        start = max(0, len(values) - BUFFER_SIZE)
-        count = len(values) - start
+        count = self.buffer_len
+        start = self._recent_start(count)
         total = 0
-        for i in range(start, len(values)):
-            total += values[i]
+        for i in range(count):
+            total += self.ir_buffer[self._idx(start, i)]
         mean = total / count
         abs_total = 0
-        for i in range(start, len(values)):
-            abs_total += abs(values[i] - mean)
+        for i in range(count):
+            abs_total += abs(self.ir_buffer[self._idx(start, i)] - mean)
         abs_avg = abs_total / count
         threshold = max(20, abs_avg * 0.6)
         min_gap = int(SAMPLE_RATE_HZ * 0.35)
@@ -228,17 +235,19 @@ class MAX30100:
         peak_count = 0
         interval_sum = 0
         prev_peak = None
-        for i in range(start + 1, len(values) - 1):
-            local_i = i - start
-            if local_i - last_peak < min_gap:
+        for i in range(1, count - 1):
+            if i - last_peak < min_gap:
                 continue
-            centered = values[i] - mean
-            if centered > threshold and values[i] > values[i - 1] and values[i] >= values[i + 1]:
+            prev_value = self.ir_buffer[self._idx(start, i - 1)]
+            value = self.ir_buffer[self._idx(start, i)]
+            next_value = self.ir_buffer[self._idx(start, i + 1)]
+            centered = value - mean
+            if centered > threshold and value > prev_value and value >= next_value:
                 if prev_peak is not None:
-                    interval_sum += local_i - prev_peak
-                prev_peak = local_i
+                    interval_sum += i - prev_peak
+                prev_peak = i
                 peak_count += 1
-                last_peak = local_i
+                last_peak = i
         if peak_count < 2:
             return None
         avg_interval = interval_sum / (peak_count - 1)
@@ -251,19 +260,20 @@ class MAX30100:
 
     def _estimate_spo2(self):
         """用 AC/DC 比值估算 SpO2。"""
-        if len(self.ir_buffer) < SAMPLE_RATE_HZ * 2:
+        if self.buffer_len < SAMPLE_RATE_HZ * 2:
             return None
-        start = max(0, len(self.ir_buffer) - BUFFER_SIZE)
-        count = len(self.ir_buffer) - start
+        count = self.buffer_len
+        start = self._recent_start(count)
         ir_sum = 0
         red_sum = 0
         ir_min = None
         ir_max = None
         red_min = None
         red_max = None
-        for i in range(start, len(self.ir_buffer)):
-            ir_value = self.ir_buffer[i]
-            red_value = self.red_buffer[i]
+        for i in range(count):
+            idx = self._idx(start, i)
+            ir_value = self.ir_buffer[idx]
+            red_value = self.red_buffer[idx]
             ir_sum += ir_value
             red_sum += red_value
             if ir_min is None or ir_value < ir_min:
