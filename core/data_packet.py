@@ -34,6 +34,9 @@ class DataPacketBuilder:
                 "temp": self._round2(self._get_env(sensor_data, "temperature")),
                 "hum": self._round2(self._get_env(sensor_data, "humidity")),
                 "light": self._get(sensor_data, "light", "light"),
+                "pressure_hpa": self._round2(self._get_barometer(sensor_data, "pressure_hpa")),
+                "pressure_pa": self._round2(self._get_barometer(sensor_data, "pressure_pa")),
+                "altitude_m": self._round2(self._get_barometer(sensor_data, "altitude_m")),
             },
             "vital": self._vital(sensor_data),
             "device": {
@@ -281,6 +284,11 @@ class DataPacketBuilder:
         if name == "humidity":
             return env.get("humidity") if env.get("humidity") is not None else env.get("hum")
         return None
+
+    def _get_barometer(self, root, name):
+        """读取 BMP280/BME280 气压驱动字段。"""
+        data = root.get("barometer") or {}
+        return data.get(name) if isinstance(data, dict) else None
 
     def _alert_level(self, warning):
         """把算法等级转换为协议 0-3 状态码。"""
