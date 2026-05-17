@@ -7,6 +7,17 @@ except ImportError:
 
 import config
 import time
+try:
+    import gc
+except ImportError:
+    gc = None
+try:
+    import socket
+except ImportError:
+    try:
+        import usocket as socket
+    except ImportError:
+        socket = None
 
 try:
     from umqtt.robust import MQTTClient
@@ -25,6 +36,7 @@ class HelmetMQTTClient:
         self.connected = False
         self.client = None
         self.last_connect_attempt = 0
+        self.last_publish_failure = 0
         if MQTTClient is not None:
             self.client = MQTTClient(
                 client_id=config.MQTT_CLIENT_ID,
@@ -46,13 +58,14 @@ class HelmetMQTTClient:
             return False
         self.last_connect_attempt = now
         try:
-            self.client.connect()
+            self._connect_client()
             self.connected = True
             print("[MQTT] connected")
             return True
         except Exception as exc:
             self.connected = False
             print("[MQTT] connect failed:", exc)
+            self.last_publish_failure = self._ticks_ms()
             self._safe_disconnect()
             return False
 
@@ -87,17 +100,25 @@ class HelmetMQTTClient:
 
     def _publish(self, topic, payload):
         """内部发布函数，发送前把 dict 转 JSON。"""
+        now = self._ticks_ms()
+        retry_ms = int(getattr(config, "MQTT_PUBLISH_RETRY_INTERVAL_MS", 10000))
+        if self.last_publish_failure and self._ticks_diff(now, self.last_publish_failure) < retry_ms:
+            return False
         if not self.connected and not self.connect():
             return False
         try:
+            if gc:
+                gc.collect()
             data = self._dumps(payload) if isinstance(payload, dict) else str(payload)
             topic_bytes = topic if isinstance(topic, bytes) else topic.encode()
             data_bytes = data if isinstance(data, bytes) else data.encode()
             self.client.publish(topic_bytes, data_bytes)
+            self.last_publish_failure = 0
             return True
         except Exception as exc:
             print("[MQTT] publish failed:", exc)
             self.connected = False
+            self.last_publish_failure = self._ticks_ms()
             self._safe_disconnect()
             return False
 
@@ -108,6 +129,40 @@ class HelmetMQTTClient:
                 self.client.disconnect()
         except Exception:
             pass
+
+    def _connect_client(self):
+        broker = config.MQTT_BROKER
+        if not self._is_ipv4(broker) or socket is None or not hasattr(socket, "getaddrinfo"):
+            return self.client.connect()
+
+        original_getaddrinfo = socket.getaddrinfo
+
+        def direct_ip_getaddrinfo(host, port, *args, **kwargs):
+            if host == broker:
+                family = getattr(socket, "AF_INET", 2)
+                socktype = getattr(socket, "SOCK_STREAM", 1)
+                return [(family, socktype, 0, "", (broker, port))]
+            return original_getaddrinfo(host, port, *args, **kwargs)
+
+        socket.getaddrinfo = direct_ip_getaddrinfo
+        try:
+            return self.client.connect()
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
+
+    def _is_ipv4(self, value):
+        if not isinstance(value, str):
+            return False
+        parts = value.split(".")
+        if len(parts) != 4:
+            return False
+        for part in parts:
+            if not part or not part.isdigit():
+                return False
+            number = int(part)
+            if number < 0 or number > 255:
+                return False
+        return True
 
     def _dumps(self, payload):
         try:

@@ -3,6 +3,10 @@
 import sys
 import time
 import config
+try:
+    import gc
+except ImportError:
+    gc = None
 
 try:
     import os
@@ -451,10 +455,33 @@ def build_hardware():
 
 
 def select_warning(warnings):
-    triggered = [item for item in warnings if item and item.get("triggered")]
-    if not triggered:
-        return None
-    return sorted(triggered, key=lambda item: _warning_rank(item.get("level")), reverse=True)[0]
+    selected = None
+    selected_rank = -1
+    for item in warnings or []:
+        if not item or not item.get("triggered"):
+            continue
+        rank = _warning_rank(item.get("level"))
+        if rank > selected_rank:
+            selected = item
+            selected_rank = rank
+    return selected
+
+
+def warning_upload_due(warning, last_warning_upload):
+    if not warning:
+        return False
+    interval_ms = int(getattr(config, "WARNING_UPLOAD_INTERVAL_MS", 5000))
+    key = "{}:{}:{}".format(
+        warning.get("category"),
+        warning.get("message"),
+        warning.get("level"),
+    )
+    now = ticks_ms()
+    last = last_warning_upload.get(key)
+    if last is None or ticks_diff(now, last) >= interval_ms:
+        last_warning_upload[key] = now
+        return True
+    return False
 
 
 def upload_payload(payload, mqtt, g4, cache, warning=False):
@@ -467,15 +494,24 @@ def upload_payload(payload, mqtt, g4, cache, warning=False):
     if not ok and raw_fallback and g4 is not None:
         ok = g4.send_json(payload)
     if not ok:
+        if not warning:
+            cache[:] = [item for item in cache if item[1]]
         cache.append((payload, warning))
         while len(cache) > config.COMM_CACHE_MAX:
             cache.pop(0)
     return ok
 
 
-def flush_cache(mqtt, g4, cache):
+def flush_cache(mqtt, g4, cache, max_items=None):
+    if not cache:
+        return
+    max_items = int(max_items if max_items is not None else getattr(config, "COMM_CACHE_FLUSH_BATCH", 1))
     kept = []
+    sent_count = 0
     for payload, warning in cache:
+        if sent_count >= max_items:
+            kept.append((payload, warning))
+            continue
         ok = False
         if config.MQTT_ENABLE and mqtt is not None:
             ok = mqtt.publish_warning(payload) if warning else mqtt.publish_telemetry(payload)
@@ -484,6 +520,8 @@ def flush_cache(mqtt, g4, cache):
             ok = g4.send_json(payload)
         if not ok:
             kept.append((payload, warning))
+        else:
+            sent_count += 1
     cache[:] = kept[-config.COMM_CACHE_MAX:]
 
 
@@ -498,8 +536,6 @@ def main():
 
     comm_enabled = bool(getattr(config, "COMM_UPLOAD_ENABLE", True))
     mqtt = HelmetMQTTClient() if comm_enabled and config.MQTT_ENABLE else None
-    if mqtt:
-        mqtt.connect()
 
     status = SystemStatus()
     status.set_network("mqtt" if mqtt and mqtt.connected else "4g")
@@ -510,6 +546,8 @@ def main():
     last_upload = ticks_ms()
     last_heartbeat = ticks_ms()
     last_algorithm_debug = ticks_ms()
+    last_cache_flush = ticks_ms()
+    last_warning_upload = {}
     boot_ms = ticks_ms()
 
     print("[MAIN] smart helmet started")
@@ -568,8 +606,8 @@ def main():
                 buzzer.off()
 
             alerts = packet_builder.alerts_from_warnings(warnings)
-            active_warnings = [item for item in warnings if item and item.get("triggered")]
             if _algorithm_debug_enabled():
+                active_warnings = [item for item in warnings if item and item.get("triggered")]
                 now_ms = ticks_ms()
                 debug_due = ticks_diff(now_ms, last_algorithm_debug) >= _algorithm_debug_interval_ms()
                 if debug_due or active_warnings:
@@ -577,22 +615,30 @@ def main():
                     last_algorithm_debug = now_ms
 
             if getattr(config, "ALGORITHM_DEBUG_ONLY", False):
+                if buzzer:
+                    buzzer.tick()
                 sleep_ms(config.SENSOR_UPDATE_MS)
                 continue
 
-            telemetry = packet_builder.build_data(sensor_data, status.to_dict(), alerts, algorithm_result)
             warning = select_warning(warnings)
 
             if warning:
-                warning_packet = _warning_packet(config.DEVICE_ID, warning, gps_data, packet_builder)
-                upload_payload(warning_packet, mqtt, g4, cache, warning=True)
                 if buzzer:
                     buzzer.alert(_buzzer_level(warning.get("level")))
+                if warning_upload_due(warning, last_warning_upload):
+                    warning_packet = _warning_packet(config.DEVICE_ID, warning, gps_data, packet_builder)
+                    upload_payload(warning_packet, mqtt, g4, cache, warning=True)
 
             if ticks_diff(ticks_ms(), last_upload) >= config.UPLOAD_INTERVAL_MS:
+                if gc:
+                    gc.collect()
+                telemetry = packet_builder.build_data(sensor_data, status.to_dict(), alerts, algorithm_result)
                 upload_payload(telemetry, mqtt, g4, cache, warning=False)
-                flush_cache(mqtt, g4, cache)
                 last_upload = ticks_ms()
+
+            if cache and ticks_diff(ticks_ms(), last_cache_flush) >= getattr(config, "COMM_CACHE_FLUSH_INTERVAL_MS", 10000):
+                flush_cache(mqtt, g4, cache)
+                last_cache_flush = ticks_ms()
 
             if ticks_diff(ticks_ms(), last_heartbeat) >= config.HEARTBEAT_INTERVAL_MS:
                 heartbeat = packet_builder.build_heartbeat(status.to_dict())
@@ -602,6 +648,10 @@ def main():
 
         except Exception as exc:
             print("[MAIN] loop error:", exc)
+            if gc:
+                gc.collect()
+        if buzzer:
+            buzzer.tick()
         sleep_ms(config.SENSOR_UPDATE_MS)
 
 

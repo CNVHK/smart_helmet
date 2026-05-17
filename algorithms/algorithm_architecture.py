@@ -131,16 +131,11 @@ class RuntimeFeatureTracker:
             "gps_speed": gps_speed,
         })
 
-        recent_history = self._recent_history(seconds=10)
-        speeds = [item["gps_speed"] for item in recent_history if item["gps_speed"] is not None]
-        speed_variation = self._range(speeds)
-
-        recent_gyro = [item["gyro_norm"] for item in recent_history]
-        avg_gyro = sum(recent_gyro) / len(recent_gyro) if recent_gyro else 0.0
+        stats = self._recent_stats(seconds=10, now=now)
+        speed_variation = stats["speed_range"]
+        avg_gyro = stats["avg_gyro"]
         head_stability = _clamp(1.0 - avg_gyro / 120.0, 0.0, 1.0)
-
-        recent_acc = [item["acc_norm"] for item in recent_history]
-        motion_intensity = _clamp((self._range(recent_acc) / 2.0) + (avg_gyro / 240.0), 0.0, 1.0)
+        motion_intensity = _clamp((stats["acc_range"] / 2.0) + (avg_gyro / 240.0), 0.0, 1.0)
 
         return {
             "pitch_deg": round(pitch, 1),
@@ -171,6 +166,38 @@ class RuntimeFeatureTracker:
         while self.nod_events and now - self.nod_events[0] > 60.0:
             self.nod_events.popleft()
         self.nod_count_1min = len(self.nod_events)
+
+    def _recent_stats(self, seconds, now):
+        cutoff = now - seconds
+        count = 0
+        gyro_sum = 0.0
+        acc_min = None
+        acc_max = None
+        speed_min = None
+        speed_max = None
+
+        for item in self.history:
+            if item["timestamp"] < cutoff:
+                continue
+            count += 1
+            gyro_sum += item["gyro_norm"]
+            acc = item["acc_norm"]
+            if acc_min is None or acc < acc_min:
+                acc_min = acc
+            if acc_max is None or acc > acc_max:
+                acc_max = acc
+            speed = item["gps_speed"]
+            if speed is not None:
+                if speed_min is None or speed < speed_min:
+                    speed_min = speed
+                if speed_max is None or speed > speed_max:
+                    speed_max = speed
+
+        return {
+            "avg_gyro": gyro_sum / count if count else 0.0,
+            "acc_range": (acc_max - acc_min) if acc_min is not None and acc_max is not None else 0.0,
+            "speed_range": (speed_max - speed_min) if speed_min is not None and speed_max is not None else 0.0,
+        }
 
     def _recent_history(self, seconds):
         """返回最近 seconds 秒的历史窗口，避免多处重复切片和边界计算。"""

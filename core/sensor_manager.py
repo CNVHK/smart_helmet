@@ -1,19 +1,17 @@
-"""统一传感器管理。"""
+"""Unified sensor manager."""
 
 from core.data_filter import SensorFilterBank
 
 
 class SensorManager:
-    """初始化、读取和记录所有传感器状态。"""
+    """Initialize, read and track all sensors."""
 
     def __init__(self, sensors=None):
-        """传入 name->sensor 对象字典。"""
         self.sensors = sensors or {}
         self.status = {}
         self.filters = SensorFilterBank(size=3)
 
     def init_all(self):
-        """初始化所有传感器，单个失败不影响其他设备。"""
         for name, sensor in self.sensors.items():
             try:
                 ok = sensor.init() if hasattr(sensor, "init") else True
@@ -24,7 +22,6 @@ class SensorManager:
         return self.status
 
     def read_all(self):
-        """周期读取所有传感器，返回 name->data 的统一结构。"""
         result = {}
         for name, sensor in self.sensors.items():
             try:
@@ -40,6 +37,4 @@ class SensorManager:
         return result
 
     def get_status(self):
-        """返回各传感器在线状态。"""
         return self.status
-

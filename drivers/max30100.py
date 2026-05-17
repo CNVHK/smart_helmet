@@ -171,20 +171,40 @@ class MAX30100:
         for ir, red in samples:
             self.ir_buffer.append(ir)
             self.red_buffer.append(red)
-        if len(self.ir_buffer) > BUFFER_SIZE:
-            self.ir_buffer = self.ir_buffer[-BUFFER_SIZE:]
-            self.red_buffer = self.red_buffer[-BUFFER_SIZE:]
+        while len(self.ir_buffer) > BUFFER_SIZE:
+            self.ir_buffer.pop(0)
+        while len(self.red_buffer) > BUFFER_SIZE:
+            self.red_buffer.pop(0)
 
     def _estimate_contact(self):
         """根据 DC 强度和波动粗略判断是否接触。"""
         if len(self.ir_buffer) < 10:
             return 0
-        recent_ir = self.ir_buffer[-30:]
-        recent_red = self.red_buffer[-30:]
-        ir_avg = sum(recent_ir) / len(recent_ir)
-        red_avg = sum(recent_red) / len(recent_red)
-        ir_span = max(recent_ir) - min(recent_ir)
-        red_span = max(recent_red) - min(recent_red)
+        start = max(0, len(self.ir_buffer) - 30)
+        count = len(self.ir_buffer) - start
+        ir_sum = 0
+        red_sum = 0
+        ir_min = None
+        ir_max = None
+        red_min = None
+        red_max = None
+        for i in range(start, len(self.ir_buffer)):
+            ir = self.ir_buffer[i]
+            red = self.red_buffer[i]
+            ir_sum += ir
+            red_sum += red
+            if ir_min is None or ir < ir_min:
+                ir_min = ir
+            if ir_max is None or ir > ir_max:
+                ir_max = ir
+            if red_min is None or red < red_min:
+                red_min = red
+            if red_max is None or red > red_max:
+                red_max = red
+        ir_avg = ir_sum / count
+        red_avg = red_sum / count
+        ir_span = ir_max - ir_min
+        red_span = red_max - red_min
         return 1 if ir_avg > 1000 and red_avg > 1000 and (ir_span > 10 or red_span > 10) else 0
 
     def _estimate_hr(self):
@@ -192,26 +212,36 @@ class MAX30100:
         values = self.ir_buffer
         if len(values) < SAMPLE_RATE_HZ * 2:
             return None
-        window = values[-BUFFER_SIZE:]
-        mean = sum(window) / len(window)
-        centered = [v - mean for v in window]
-        abs_avg = sum([abs(v) for v in centered]) / len(centered)
+        start = max(0, len(values) - BUFFER_SIZE)
+        count = len(values) - start
+        total = 0
+        for i in range(start, len(values)):
+            total += values[i]
+        mean = total / count
+        abs_total = 0
+        for i in range(start, len(values)):
+            abs_total += abs(values[i] - mean)
+        abs_avg = abs_total / count
         threshold = max(20, abs_avg * 0.6)
-        peaks = []
         min_gap = int(SAMPLE_RATE_HZ * 0.35)
         last_peak = -min_gap
-        for i in range(1, len(centered) - 1):
-            if i - last_peak < min_gap:
+        peak_count = 0
+        interval_sum = 0
+        prev_peak = None
+        for i in range(start + 1, len(values) - 1):
+            local_i = i - start
+            if local_i - last_peak < min_gap:
                 continue
-            if centered[i] > threshold and centered[i] > centered[i - 1] and centered[i] >= centered[i + 1]:
-                peaks.append(i)
-                last_peak = i
-        if len(peaks) < 2:
+            centered = values[i] - mean
+            if centered > threshold and values[i] > values[i - 1] and values[i] >= values[i + 1]:
+                if prev_peak is not None:
+                    interval_sum += local_i - prev_peak
+                prev_peak = local_i
+                peak_count += 1
+                last_peak = local_i
+        if peak_count < 2:
             return None
-        intervals = []
-        for i in range(1, len(peaks)):
-            intervals.append(peaks[i] - peaks[i - 1])
-        avg_interval = sum(intervals) / len(intervals)
+        avg_interval = interval_sum / (peak_count - 1)
         if avg_interval <= 0:
             return None
         hr = 60.0 * SAMPLE_RATE_HZ / avg_interval
@@ -223,14 +253,33 @@ class MAX30100:
         """用 AC/DC 比值估算 SpO2。"""
         if len(self.ir_buffer) < SAMPLE_RATE_HZ * 2:
             return None
-        ir = self.ir_buffer[-BUFFER_SIZE:]
-        red = self.red_buffer[-BUFFER_SIZE:]
-        ir_dc = sum(ir) / len(ir)
-        red_dc = sum(red) / len(red)
+        start = max(0, len(self.ir_buffer) - BUFFER_SIZE)
+        count = len(self.ir_buffer) - start
+        ir_sum = 0
+        red_sum = 0
+        ir_min = None
+        ir_max = None
+        red_min = None
+        red_max = None
+        for i in range(start, len(self.ir_buffer)):
+            ir_value = self.ir_buffer[i]
+            red_value = self.red_buffer[i]
+            ir_sum += ir_value
+            red_sum += red_value
+            if ir_min is None or ir_value < ir_min:
+                ir_min = ir_value
+            if ir_max is None or ir_value > ir_max:
+                ir_max = ir_value
+            if red_min is None or red_value < red_min:
+                red_min = red_value
+            if red_max is None or red_value > red_max:
+                red_max = red_value
+        ir_dc = ir_sum / count
+        red_dc = red_sum / count
         if ir_dc <= 0 or red_dc <= 0:
             return None
-        ir_ac = max(ir) - min(ir)
-        red_ac = max(red) - min(red)
+        ir_ac = ir_max - ir_min
+        red_ac = red_max - red_min
         if ir_ac <= 0 or red_ac <= 0:
             return None
         ratio = (red_ac / red_dc) / (ir_ac / ir_dc)

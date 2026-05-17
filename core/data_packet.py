@@ -5,6 +5,7 @@ try:
 except ImportError:
     import json
 import time
+import config
 
 
 def now_s():
@@ -56,9 +57,10 @@ class DataPacketBuilder:
                 "spo2_alert": alerts.get("spo2_alert", 0),
             },
         }
-        algorithm_payload = self._algorithm(algorithm)
-        if algorithm_payload is not None:
-            payload["algorithm"] = algorithm_payload
+        if getattr(config, "TELEMETRY_INCLUDE_ALGORITHM", False):
+            algorithm_payload = self._algorithm(algorithm)
+            if algorithm_payload is not None:
+                payload["algorithm"] = algorithm_payload
         return payload
 
     def build_telemetry(self, sensor_data, system_data=None, alerts=None, algorithm=None):
