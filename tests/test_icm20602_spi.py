@@ -23,8 +23,12 @@ def sleep_ms(ms):
 def make_pin(pin_id, mode=None, pin_name=None):
     ids = []
     if pin_name is not None:
-        ids.append(pin_name)
-    ids.append(pin_id)
+        if isinstance(pin_name, (list, tuple)):
+            ids.extend(pin_name)
+        else:
+            ids.append(pin_name)
+    if pin_id is not None:
+        ids.append(pin_id)
     for item in ids:
         try:
             return Pin(item, mode) if mode is not None else Pin(item)
@@ -33,26 +37,37 @@ def make_pin(pin_id, mode=None, pin_name=None):
     return None
 
 
-def main():
-    spi = SPI(
+def make_spi():
+    return SPI(
         config.SPI_ID,
         baudrate=config.SPI_BAUDRATE,
         bits=getattr(config, "SPI_BITS", 8),
-        polarity=getattr(config, "SPI_POLARITY", 0),
-        phase=getattr(config, "SPI_PHASE", 0),
+        polarity=getattr(config, "SPI_POLARITY", 1),
+        phase=getattr(config, "SPI_PHASE", 1),
     )
+
+
+def main():
+    print("spi id:", config.SPI_ID)
+    print("spi baudrate:", config.SPI_BAUDRATE)
+    print("spi mode:", getattr(config, "SPI_POLARITY", 1), getattr(config, "SPI_PHASE", 1))
+    print("cs pin name:", getattr(config, "ICM20602_CS_PIN_NAME", None))
+
+    spi = make_spi()
     cs = make_pin(
         getattr(config, "ICM20602_CS_PIN", None),
         Pin.OUT,
         getattr(config, "ICM20602_CS_PIN_NAME", None),
     )
-    imu = ICM20602SPI(spi, cs)
+    imu = ICM20602SPI(
+        spi,
+        cs,
+        cs_always_low=bool(getattr(config, "ICM20602_CS_ALWAYS_LOW", False)),
+    )
+    print("WHO_AM_I before init:", hex(imu._read_reg(WHO_AM_I)))
     ok = imu.init()
     print("init:", ok)
-    try:
-        print("WHO_AM_I:", hex(imu._read_reg(WHO_AM_I)))
-    except Exception as exc:
-        print("WHO_AM_I read failed:", exc)
+    print("WHO_AM_I:", hex(imu._read_reg(WHO_AM_I)))
 
     while True:
         print(imu.read())

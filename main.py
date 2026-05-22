@@ -424,24 +424,30 @@ def make_uart(uart_id, baudrate, tx_pin, rx_pin):
 
 
 def make_spi():
+    spi_id = getattr(config, "SPI_ID", 1)
+    baudrate = getattr(config, "SPI_BAUDRATE", 1000000)
+    bits = getattr(config, "SPI_BITS", 8)
+    polarity = getattr(config, "SPI_POLARITY", 0)
+    phase = getattr(config, "SPI_PHASE", 0)
+
     try:
-        return SPI(
-            config.SPI_ID,
-            baudrate=config.SPI_BAUDRATE,
-            bits=getattr(config, "SPI_BITS", 8),
-            polarity=getattr(config, "SPI_POLARITY", 0),
-            phase=getattr(config, "SPI_PHASE", 0),
-        )
+        spi = SPI(spi_id, baudrate=baudrate, bits=bits, polarity=polarity, phase=phase)
+        print("[MAIN] SPI init ok:", spi_id)
+        return spi
     except Exception as exc:
         print("[MAIN] SPI init failed:", exc)
-        return None
+    return None
 
 
 def make_pin(pin_id, mode=None, pull=None, pin_name=None):
     ids = []
     if pin_name is not None:
-        ids.append(pin_name)
-    ids.append(pin_id)
+        if isinstance(pin_name, (list, tuple)):
+            ids.extend(pin_name)
+        else:
+            ids.append(pin_name)
+    if pin_id is not None:
+        ids.append(pin_id)
     for item in ids:
         try:
             if pull is not None:
@@ -458,12 +464,15 @@ def make_imu(i2c):
     imu_type = getattr(config, "IMU_TYPE", "lis2dh12")
     if imu_type == "icm20602_spi":
         spi = make_spi()
-        cs = make_pin(
-            getattr(config, "ICM20602_CS_PIN", None),
-            Pin.OUT,
-            pin_name=getattr(config, "ICM20602_CS_PIN_NAME", None),
-        )
-        return ICM20602SPI(spi, cs)
+        cs_always_low = bool(getattr(config, "ICM20602_CS_ALWAYS_LOW", False))
+        cs = None
+        if not cs_always_low:
+            cs = make_pin(
+                getattr(config, "ICM20602_CS_PIN", None),
+                Pin.OUT,
+                pin_name=getattr(config, "ICM20602_CS_PIN_NAME", None),
+            )
+        return ICM20602SPI(spi, cs, cs_always_low=cs_always_low)
     return IMU(i2c) if i2c is not None else None
 
 

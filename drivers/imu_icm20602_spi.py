@@ -16,6 +16,7 @@ CONFIG = 0x1A
 GYRO_CONFIG = 0x1B
 ACCEL_CONFIG = 0x1C
 ACCEL_CONFIG2 = 0x1D
+I2C_IF = 0x70
 ACCEL_XOUT_H = 0x3B
 
 READ_FLAG = 0x80
@@ -35,10 +36,11 @@ def _sleep_ms(ms):
 class ICM20602SPI:
     """SPI ICM-20602 6-axis IMU driver with unified sensor output."""
 
-    def __init__(self, spi, cs_pin):
+    def __init__(self, spi, cs_pin=None, cs_always_low=False):
         """Keep the SPI bus and chip-select pin."""
         self.spi = spi
         self.cs = cs_pin
+        self.cs_always_low = bool(cs_always_low)
         self.offset = {
             "ax": 0.0,
             "ay": 0.0,
@@ -48,37 +50,52 @@ class ICM20602SPI:
             "gz": 0.0,
         }
         self._available = False
-        if self.cs is not None:
+        self.last_error = "not_initialized"
+        if self.cs is not None and not self.cs_always_low:
             self.cs.value(1)
 
     def init(self):
         """Reset the chip, verify WHO_AM_I and configure +-2g / +-250dps."""
-        if self.spi is None or self.cs is None:
+        if self.spi is None:
             self._available = False
+            self.last_error = "spi_not_available"
+            print("[ICM20602] SPI not available")
+            return False
+        if self.cs is None and not self.cs_always_low:
+            self._available = False
+            self.last_error = "cs_pin_not_available"
+            print("[ICM20602] CS pin not available")
             return False
         try:
+            who_before = self._read_reg(WHO_AM_I)
+            print("[ICM20602] WHO_AM_I before init:", hex(who_before))
+
             self._write_reg(PWR_MGMT_1, 0x80)
             _sleep_ms(100)
             self._write_reg(PWR_MGMT_1, 0x01)
             _sleep_ms(10)
             self._write_reg(PWR_MGMT_2, 0x00)
             self._write_reg(SMPLRT_DIV, 0x09)
-            self._write_reg(CONFIG, 0x03)
+            self._write_reg(CONFIG, 0x01)
             self._write_reg(GYRO_CONFIG, 0x00)
             self._write_reg(ACCEL_CONFIG, 0x00)
             self._write_reg(ACCEL_CONFIG2, 0x03)
+            self._write_reg(I2C_IF, 0x40)
             _sleep_ms(20)
 
             who = self._read_reg(WHO_AM_I)
             if who != WHO_AM_I_VAL:
                 print("[ICM20602] WHO_AM_I mismatch:", hex(who))
                 self._available = False
+                self.last_error = "who_am_i_mismatch_" + hex(who)
                 return False
             self._available = True
+            self.last_error = None
             return True
         except Exception as exc:
             print("[ICM20602] init failed:", exc)
             self._available = False
+            self.last_error = "imu_init_failed"
             return False
 
     def check(self):
@@ -118,7 +135,7 @@ class ICM20602SPI:
     def read(self):
         """Read acceleration and gyroscope data in unified dict format."""
         if not self._available:
-            return self._result(False, None, "imu_not_available")
+            return self._result(False, None, self.last_error or "imu_not_available")
         try:
             raw = self._read_motion()
             if raw is None:
@@ -135,6 +152,7 @@ class ICM20602SPI:
         except Exception as exc:
             print("[ICM20602] read failed:", exc)
             self._available = False
+            self.last_error = "imu_read_failed"
             return self._result(False, None, "imu_read_failed")
 
     @property
@@ -142,24 +160,37 @@ class ICM20602SPI:
         """Compatibility status attribute."""
         return self._available
 
+    def _select(self):
+        if self.cs is not None and not self.cs_always_low:
+            self.cs.value(0)
+
+    def _deselect(self):
+        if self.cs is not None and not self.cs_always_low:
+            self.cs.value(1)
+
     def _write_reg(self, reg, value):
-        self.cs.value(0)
+        self._select()
         try:
             self.spi.write(bytes([reg & 0x7F, value & 0xFF]))
         finally:
-            self.cs.value(1)
+            self._deselect()
 
     def _read_reg(self, reg):
         data = self._read_regs(reg, 1)
         return data[0]
 
     def _read_regs(self, reg, length):
-        self.cs.value(0)
+        self._select()
         try:
+            tx = bytes([reg | READ_FLAG]) + bytes([0x00] * length)
+            rx = bytearray(length + 1)
+            if hasattr(self.spi, "write_readinto"):
+                self.spi.write_readinto(tx, rx)
+                return bytes(rx[1:])
             self.spi.write(bytes([reg | READ_FLAG]))
-            return self.spi.read(length, 0xFF)
+            return self.spi.read(length, 0x00)
         finally:
-            self.cs.value(1)
+            self._deselect()
 
     def _read_motion(self):
         data = self._read_regs(ACCEL_XOUT_H, 14)
