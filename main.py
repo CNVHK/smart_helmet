@@ -19,11 +19,12 @@ if _ROOT_DIR not in sys.path:
 from algorithms.algorithm_architecture import SmartHelmetAlgorithm
 
 try:
-    from machine import I2C, UART, Pin, ADC
+    from machine import I2C, SPI, UART, Pin, ADC
 except ImportError:
-    I2C = UART = Pin = ADC = None
+    I2C = SPI = UART = Pin = ADC = None
 
 from drivers.imu import IMU
+from drivers.imu_icm20602_spi import ICM20602SPI
 from drivers.sht40 import SHT40
 from drivers.jx90614 import JX90614
 from drivers.max30100 import MAX30100
@@ -422,6 +423,20 @@ def make_uart(uart_id, baudrate, tx_pin, rx_pin):
     return None
 
 
+def make_spi():
+    try:
+        return SPI(
+            config.SPI_ID,
+            baudrate=config.SPI_BAUDRATE,
+            bits=getattr(config, "SPI_BITS", 8),
+            polarity=getattr(config, "SPI_POLARITY", 0),
+            phase=getattr(config, "SPI_PHASE", 0),
+        )
+    except Exception as exc:
+        print("[MAIN] SPI init failed:", exc)
+        return None
+
+
 def make_pin(pin_id, mode=None, pull=None, pin_name=None):
     ids = []
     if pin_name is not None:
@@ -437,6 +452,19 @@ def make_pin(pin_id, mode=None, pull=None, pin_name=None):
         except Exception as exc:
             print("[MAIN] Pin init failed:", item, exc)
     return None
+
+
+def make_imu(i2c):
+    imu_type = getattr(config, "IMU_TYPE", "lis2dh12")
+    if imu_type == "icm20602_spi":
+        spi = make_spi()
+        cs = make_pin(
+            getattr(config, "ICM20602_CS_PIN", None),
+            Pin.OUT,
+            pin_name=getattr(config, "ICM20602_CS_PIN_NAME", None),
+        )
+        return ICM20602SPI(spi, cs)
+    return IMU(i2c) if i2c is not None else None
 
 
 def build_hardware():
@@ -470,7 +498,7 @@ def build_hardware():
     temp_hum = SHT40(i2c, addr=config.SHT40_ADDR) if i2c is not None and config.SHT40_ENABLE else None
     light_sensor = GY302(i2c, addr=config.GY302_ADDR) if i2c is not None and config.GY302_ENABLE else ADCLightSensor(light_adc)
     sensors = {
-        "imu": IMU(i2c) if i2c is not None else None,
+        "imu": make_imu(i2c),
         "sht40": temp_hum,
         "jx90614": JX90614(i2c, config.JX90614_ADDR) if i2c is not None and config.JX90614_ENABLE else None,
         "max30100": MAX30100(i2c) if i2c is not None else None,

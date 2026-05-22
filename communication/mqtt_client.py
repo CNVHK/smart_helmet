@@ -20,10 +20,10 @@ except ImportError:
         socket = None
 
 try:
-    from umqtt.robust import MQTTClient
+    from umqtt.simple import MQTTClient
 except ImportError:
     try:
-        from umqtt.simple import MQTTClient
+        from umqtt.robust import MQTTClient
     except ImportError:
         MQTTClient = None
 
@@ -37,6 +37,7 @@ class HelmetMQTTClient:
         self.client = None
         self.last_connect_attempt = 0
         self.last_publish_failure = 0
+        self.last_hard_failure = 0
         self._new_client()
 
     def connect(self):
@@ -59,13 +60,12 @@ class HelmetMQTTClient:
         except Exception as exc:
             self.connected = False
             print("[MQTT] connect failed:", exc)
-            self.last_publish_failure = self._ticks_ms()
-            self._safe_disconnect()
+            self._mark_failure(hard=True)
             return False
 
     def reconnect(self):
         """自动重连接口。"""
-        self._safe_disconnect()
+        self._drop_client()
         return self.connect()
 
     def publish_telemetry(self, payload):
@@ -96,6 +96,9 @@ class HelmetMQTTClient:
         """内部发布函数，发送前把 dict 转 JSON。"""
         now = self._ticks_ms()
         retry_ms = int(getattr(config, "MQTT_PUBLISH_RETRY_INTERVAL_MS", 10000))
+        hard_retry_ms = int(getattr(config, "MQTT_HARD_FAILURE_COOLDOWN_MS", retry_ms))
+        if self.last_hard_failure and self._ticks_diff(now, self.last_hard_failure) < hard_retry_ms:
+            return False
         if self.last_publish_failure and self._ticks_diff(now, self.last_publish_failure) < retry_ms:
             return False
         if not self.connected and not self.connect():
@@ -106,14 +109,19 @@ class HelmetMQTTClient:
             data = self._dumps(payload) if isinstance(payload, dict) else str(payload)
             topic_bytes = topic if isinstance(topic, bytes) else topic.encode()
             data_bytes = data if isinstance(data, bytes) else data.encode()
+            start = self._ticks_ms()
             self.client.publish(topic_bytes, data_bytes)
+            elapsed = self._ticks_diff(self._ticks_ms(), start)
+            timeout_ms = int(getattr(config, "MQTT_PUBLISH_TIMEOUT_MS", 12000))
+            if elapsed > timeout_ms:
+                print("[MQTT] publish slow:", elapsed, "ms")
+                self._mark_failure(hard=True)
+                return False
             self.last_publish_failure = 0
             return True
         except Exception as exc:
             print("[MQTT] publish failed:", exc)
-            self.connected = False
-            self.last_publish_failure = self._ticks_ms()
-            self._safe_disconnect()
+            self._mark_failure(hard=True)
             data = None
             data_bytes = None
             if gc:
@@ -121,16 +129,29 @@ class HelmetMQTTClient:
             return False
 
     def _safe_disconnect(self):
-        """尽量释放底层 socket 资源。"""
+        """正常链路上的优雅断开。故障链路不要调用这个函数。"""
         try:
             if self.client:
                 self.client.disconnect()
         except Exception:
             pass
+        self._drop_client()
+
+    def _drop_client(self):
+        """直接丢弃 MQTTClient，避免坏 socket 继续触发 QISEND。"""
         self.client = None
         self.connected = False
         if gc:
             gc.collect()
+
+    def _mark_failure(self, hard=False):
+        """记录失败并进入冷却；hard=True 时直接丢弃底层 client。"""
+        now = self._ticks_ms()
+        self.connected = False
+        self.last_publish_failure = now
+        if hard:
+            self.last_hard_failure = now
+            self._drop_client()
 
     def _new_client(self):
         """创建新的 MQTTClient，避免失败后的底层 socket 被长期复用。"""
