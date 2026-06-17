@@ -40,6 +40,7 @@ class DataPacketBuilder:
                 "altitude_m": self._round2(self._get_barometer(sensor_data, "altitude_m")),
             },
             "vital": self._vital(sensor_data),
+            "radar": self._radar(sensor_data.get("radar")),
             "device": {
                 "battery": system_data.get("battery"),
                 "signal": system_data.get("signal"),
@@ -258,6 +259,17 @@ class DataPacketBuilder:
             "hr_valid": heart.get("hr_valid", 0),
             "spo2_valid": heart.get("spo2_valid", 0),
             "contact": heart.get("contact"),
+        }
+
+    def _radar(self, data):
+        """整理 MS60 BSD 雷达字段。"""
+        data = data or {}
+        return {
+            "detected": 1 if data.get("detected") else 0,
+            "obj_num": data.get("obj_num", 0) or 0,
+            "nearest_m": self._round2(data.get("nearest_m")),
+            "nearest_cm": self._round2(data.get("nearest_cm") or data.get("front_cm")),
+            "objects": data.get("objects", []),
         }
 
     def _gps_lat(self, data):

@@ -33,6 +33,7 @@ from drivers.light_sensor import ADCLightSensor
 from drivers.barometer import Barometer
 from drivers.gps_uart import GPSUART
 from drivers.gnss_quectel import QuectelGNSS
+from drivers.ms60_bsd_radar import MS60BSDRadar
 from drivers.ultrasonic import Ultrasonic
 from drivers.buzzer import Buzzer
 from drivers.button import Button
@@ -486,6 +487,9 @@ def build_hardware():
     gps_uart = None
     if getattr(config, "GNSS_ENABLE", True):
         gps_uart = make_uart(config.GPS_UART_ID, config.GPS_BAUDRATE, config.GPS_TX_PIN, config.GPS_RX_PIN)
+    radar_uart = None
+    if getattr(config, "RADAR_ENABLE", False):
+        radar_uart = make_uart(config.RADAR_UART_ID, config.RADAR_BAUDRATE, config.RADAR_TX_PIN, config.RADAR_RX_PIN)
     g4_uart = None
     if getattr(config, "COMM_UPLOAD_ENABLE", True) and raw_4g_enabled:
         g4_uart = make_uart(config.G4_UART_ID, config.G4_BAUDRATE, config.G4_TX_PIN, config.G4_RX_PIN)
@@ -514,6 +518,9 @@ def build_hardware():
         "barometer": Barometer(i2c, addr=config.BAROMETER_ADDR) if i2c is not None and config.BAROMETER_ENABLE else None,
         "light": light_sensor,
         "ultrasonic": Ultrasonic(trig, echo),
+        "radar": MS60BSDRadar(radar_uart, request_on_read=getattr(config, "RADAR_REQUEST_ON_READ", False))
+        if getattr(config, "RADAR_ENABLE", False)
+        else None,
     }
     if getattr(config, "GNSS_ENABLE", True):
         sensors["gps"] = gnss if gnss is not None and gnss.gnss is not None else GPSUART(gps_uart)
@@ -688,6 +695,7 @@ def main():
             if fast_collision_warning:
                 warnings.append(fast_collision_warning)
             warnings.append(distance.update(sensor_data.get("ultrasonic")))
+            warnings.append(distance.update(sensor_data.get("radar")))
 
             if buttons.get("sos") and buttons["sos"].is_pressed():
                 warnings.append({
